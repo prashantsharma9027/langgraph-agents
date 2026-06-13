@@ -1,13 +1,16 @@
 import { Annotation, MessagesAnnotation, StateGraph, END } from "@langchain/langgraph";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { AIMessage } from "@langchain/core/messages";
-import { readPdfFile } from "../utils/pdfReader";
 
 const llm = new ChatGoogleGenerativeAI({ model: "gemini-2.5-flash", temperature: 0 });
 
 export const AgentState = Annotation.Root({
   ...MessagesAnnotation.spec,
   route: Annotation<string>({ reducer: (x, y) => y ?? x, default: () => "chat" }),
+  files: Annotation<{ name: string; content: string }[]>({
+    reducer: (x, y) => y ?? x,
+    default: () => [],
+  }),
 });
 
 const routerLlm = llm.withStructuredOutput({
@@ -20,11 +23,18 @@ const routerLlm = llm.withStructuredOutput({
 
 async function supervisorNode(state: typeof AgentState.State) {
   const history = state.messages.map((m) => `${m.name || m._getType()}: ${m.content}`).join("\n");
+  const fileNames = state.files && state.files.length > 0
+    ? state.files.map(f => f.name).join(", ")
+    : "None";
+
   const prompt = `You are a supervisor directing: 'reader', 'visualizer', 'websearch', and 'chat'.
 Decide who goes next, or 'FINISH' if fully resolved.
+
+Currently Uploaded Files in Context: ${fileNames}
+
 1. 'websearch' if user asks for real-time/latest info and we haven't searched yet.
-2. 'reader' if user asks to read/summarize PDF and we haven't read it yet.
-3. 'visualizer' if user wants a chart, and we attempted to fetch data (MUST route to visualizer if chart requested).
+2. 'reader' if there are uploaded files in context and the user asks to analyze/summarize them or has text questions about them, and we haven't answered yet.
+3. 'visualizer' if the user explicitly requests a chart, plot, or visualization of data (which could be in the uploaded files or provided directly in the chat history/message text), and we haven't generated it yet.
 4. 'chat' for general questions/chats.
 5. 'FINISH' if resolved, or if 'chat' responded last (don't route to 'chat' twice consecutively).
 
@@ -45,12 +55,31 @@ async function chatNode(state: typeof AgentState.State) {
 
 async function readerNode(state: typeof AgentState.State) {
   try {
-    const text = await readPdfFile("document.pdf");
+    if (!state.files || state.files.length === 0) {
+      return {
+        messages: [new AIMessage({
+          content: "No files have been uploaded yet. Please upload files (TXT, CSV, DOCX, PDF) first to analyze them.",
+          name: "reader"
+        })]
+      };
+    }
+
+    const fileContents = state.files.map(f => `[File: ${f.name}]\n${f.content}`).join("\n\n---\n\n");
     const query = state.messages.filter((m) => m._getType() === "human").pop()?.content || "";
-    const res = await llm.invoke(`Summarize document based on user request: "${query}"\n\nContent:\n${text.slice(0, 15000)}`);
+
+    const res = await llm.invoke(
+      `Analyze and answer the user query based on the uploaded file contents:
+Query: "${query}"
+
+Uploaded Files Content:
+${fileContents.slice(0, 30000)}
+
+Formulate a helpful, direct response summarizing or answering the query. Do not output raw lists of dates and values unless the user specifically asked to see the raw table data.`
+    );
+
     return { messages: [new AIMessage({ content: res.content as string, name: "reader" })] };
   } catch (err) {
-    return { messages: [new AIMessage({ content: `PDF Reader Error: ${err instanceof Error ? err.message : String(err)}`, name: "reader" })] };
+    return { messages: [new AIMessage({ content: `Reader Error: ${err instanceof Error ? err.message : String(err)}`, name: "reader" })] };
   }
 }
 
@@ -79,15 +108,26 @@ async function visualizerNode(state: typeof AgentState.State) {
       required: ["title", "x_label", "y_label", "x_values", "y_values"]
     });
 
-    const context = state.messages.filter((m) => m._getType() === "ai" && m.name !== "visualizer").map((m) => m.content).join("\n") ||
-      state.messages.filter((m) => m._getType() === "human").pop()?.content || "";
+    const fileContents = state.files && state.files.length > 0
+      ? state.files.map(f => `[File: ${f.name}]\n${f.content}`).join("\n\n")
+      : "";
 
-    const data = await chartExtractor.invoke(`Extract data from context for a bar/line chart. If no numeric data is present, construct logical placeholder data related to the topic.\n\nContext:\n${context}`);
+    const userQuery = state.messages.filter((m) => m._getType() === "human").pop()?.content || "";
+
+    const prompt = `You are a data visualizer agent. Extract numeric data from the uploaded files or from the user query/chat history directly to build a bar or line chart based on the user's request:
+User Request: "${userQuery}"
+
+Uploaded Files Content:
+${fileContents}
+
+Extract the matching labels (x_values) and values (y_values) accurately. Provide a clear title for the chart.`;
+
+    const data = await chartExtractor.invoke(prompt);
 
     return {
       messages: [new AIMessage({
         content: JSON.stringify({
-          message: `Chart generated: ${data.title}`,
+          message: "",
           chartData: { title: data.title, labels: data.x_values, values: data.y_values }
         }),
         name: "visualizer"
