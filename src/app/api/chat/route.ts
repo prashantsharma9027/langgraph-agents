@@ -60,7 +60,7 @@ export async function POST(req: NextRequest) {
               messages: [new HumanMessage({ content: message })],
               files: parsedFiles
             },
-            { streamMode: "updates" }
+            { streamMode: "updates", recursionLimit: 100 }
           );
 
           for await (const chunk of eventStream) {
